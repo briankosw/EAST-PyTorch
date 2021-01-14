@@ -1,14 +1,101 @@
 import csv
 import os
 from glob import glob
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Union
 
 import cv2
 import numpy as np
 from PIL import Image
+import torch
+from torchvision.datasets import VisionDataset
+import torchvision.transforms as transforms
+import torchvision.transforms.functional as F
 
 # Text that should not affect evaluation: https://rrc.cvc.uab.es/?ch=4&com=tasks
 DO_NOT_CARE = "###"
+
+
+class ICDARDataset(VisionDataset):
+    def __init__(
+        self,
+        root: str,
+        input_shape: Union[int, Tuple[int, int]],
+        min_text_size: int,
+        transform: Optional[Callable] = None,
+        target_transform: Optional[Callable] = None,
+        transforms: Optional[Callable] = None,
+    ) -> None:
+        super(ICDARDataset, self).__init__(root, transforms, transform, target_transform)
+        image_pathname = os.path.join(root, "images/*.jpg")
+        self.images = sorted(glob(image_pathname))
+        annotation_pathname = os.path.join(root, "annotations/*.txt")
+        self.annotations = sorted(glob(annotation_pathname))
+        if isinstance(input_shape, tuple):
+            self.input_shape = input_shape
+        else:
+            self.input_shape = (input_shape, input_shape)
+        self.min_text_size = min_text_size
+
+    def __getitem__(self, idx: int):
+        image = Image.open(self.images[idx])
+        quads, texts = load_annotation(self.annotations[idx])
+        # Crop
+        image, quads, texts = self.transforms(image, quads, texts)
+        # Generate maps
+        score_map, geometry_map, train_ignore_mask, train_boundary_mask = generate_maps(
+            quads, texts, input_shape=self.input_shape, min_text_size=self.min_text_size
+        )
+        # Image augmentation
+        if self.transform:
+            image = self.transform(image)
+        return image, quads, texts
+
+    def __len__(self) -> int:
+        return len(self.images)
+
+
+class RandomCrop(transforms.RandomCrop):
+    def __init__(self, size, padding=None, pad_if_needed=False, fill=0, padding_mode="constant"):
+        super().__init__(size, padding, pad_if_needed, fill, padding_mode)
+
+    def forward(self, image, quads, texts):
+        """
+        Args:
+            img (PIL Image or Tensor): Image to be cropped.
+        Returns:
+            PIL Image or Tensor: Cropped image.
+        """
+        if self.padding is not None:
+            image = F.pad(image, self.padding, self.fill, self.padding_mode)
+        width, height = F._get_image_size(image)
+        # pad the width if needed
+        if self.pad_if_needed and width < self.size[1]:
+            padding = [self.size[1] - width, 0]
+            image = F.pad(image, padding, self.fill, self.padding_mode)
+        # pad the height if needed
+        if self.pad_if_needed and height < self.size[0]:
+            padding = [0, self.size[0] - height]
+            image = F.pad(image, padding, self.fill, self.padding_mode)
+        top, left, height, width = self.get_params(image, self.size)
+        image = F.crop(image, top, left, height, width)
+        bottom, right = top + height, left + width
+        indices = []
+        for i in range(len(quads)):
+            quads[i] = sort_vertices(quads[i])
+            quad_left, quad_top = quads[i][0]
+            quad_right, quad_bottom = quads[i][2]
+            if (
+                left < quad_left and top < quad_top and quad_right < right and quad_bottom < bottom
+            ):
+                # quads[i, :, 0] = np.minimum(quads[i, :, 0], right)
+                # quads[i, :, 0] = np.maximum(quads[i, :, 0], left)
+                # quads[i, :, 1] = np.minimum(quads[i, :, 1], bottom)
+                # quads[i, :, 1] = np.maximum(quads[i, :, 1], top)
+                indices.append(i)
+        quads = quads[indices] - (left, top)
+        texts = texts[indices]
+        return image, quads, texts
+
 
 
 def load_annotation(annotation_filepath: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -45,8 +132,8 @@ def generate_maps(
     quads: np.ndarray,
     texts: np.ndarray,
     input_shape: Tuple[int, int],
-    min_text_size: int
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    min_text_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Generates the score map
 
@@ -57,10 +144,11 @@ def generate_maps(
         min_text_size:
 
     Returns:
+        score_map
     """
     h, w = input_shape
     score_map = np.zeros((h, w), dtype=np.uint8)
-    geometry_map = np.zeros((h, w), dtype=np.float32)
+    geometry_map = np.zeros((h, w, 5), dtype=np.float32)
     train_ignore_mask = np.ones((h, w), dtype=np.uint8)
     train_boundary_mask = np.ones((h, w), dtype=np.uint8)
     original_quad_mask = np.zeros((h, w), dtype=np.uint8)
@@ -93,6 +181,10 @@ def generate_maps(
             geometry_map[y, x, 4] = angle
     shrinked_quad_mask = (shrinked_quad_mask > 0).astype(np.uint8)
     train_boundary_mask = 1 - (original_quad_mask - shrinked_quad_mask)
+    score_map = torch.as_tensor(score_map, dtype=torch.float32)
+    geometry_map = torch.as_tensor(geometry_map, dtype=torch.float32)
+    train_ignore_mask = torch.as_tensor(train_ignore_mask, dtype=torch.float32)
+    train_boundary_mask = torch.as_tensor(train_boundary_mask, dtype=torch.float32)
     return score_map, geometry_map, train_ignore_mask, train_boundary_mask
 
 
