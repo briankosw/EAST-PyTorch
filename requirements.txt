@@ -1,0 +1,5 @@
+torch
+torchvision
+hydra-core
+pytorch-lightning
+opencv-python
